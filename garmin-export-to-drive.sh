@@ -1,7 +1,9 @@
 #!/bin/bash
 #
-# Garmin Data Export to Google Drive (Filtered for Coaching)
-# Exports only essential CSVs needed for recovery assessment and coaching
+# Garmin Data Export to Google Drive with Claude Health Analysis
+# 1. Exports essential CSVs for recovery assessment and coaching
+# 2. Runs Claude health analyzer to generate personalized coaching report
+# 3. Uploads both CSV data and health report to Google Drive
 #
 
 # Configuration
@@ -139,13 +141,57 @@ rclone copy "$TEMP_DIR/${EXPORT_NAME}.zip" "$GDRIVE_PATH/" --verbose
 if [ $? -eq 0 ]; then
     log "SUCCESS: Uploaded to Google Drive as ${EXPORT_NAME}.zip"
     
-    # Keep a local copy in home directory (always named latest for easy access)
-    cp "$TEMP_DIR/${EXPORT_NAME}.zip" "$HOME/latest-garmin-export.zip"
-    log "Local copy saved as ~/latest-garmin-export.zip"
-    
+    # Keep a local copy in garmin-reports directory (always named latest for easy access)
+    mkdir -p "$HOME/garmin-reports"
+    cp "$TEMP_DIR/${EXPORT_NAME}.zip" "$HOME/garmin-reports/latest-garmin-export.zip"
+    log "Local copy saved as ~/garmin-reports/latest-garmin-export.zip"
+
+    # Run Claude health analyzer (only after 8am export)
+    CURRENT_HOUR=$(date '+%H')
+
+    if [ "$CURRENT_HOUR" -eq 8 ]; then
+        log "Running Claude health analyzer (daily 8am analysis)..."
+        ANALYZER_SCRIPT="$HOME/garmin-claude-analyzer/analyze_health.py"
+
+        if [ -f "$ANALYZER_SCRIPT" ]; then
+            # Run the analyzer and capture output
+            ANALYZER_OUTPUT=$(python3 "$ANALYZER_SCRIPT" 2>&1)
+            ANALYZER_EXIT_CODE=$?
+
+            if [ $ANALYZER_EXIT_CODE -eq 0 ]; then
+                log "SUCCESS: Health analysis completed"
+
+                # Find the generated MD file (today's date)
+                TODAY=$(date '+%Y-%m-%d')
+                MD_FILE="$HOME/garmin-reports/${TODAY}-health-report.md"
+
+                if [ -f "$MD_FILE" ]; then
+                    log "Uploading health report to Google Drive..."
+                    rclone copy "$MD_FILE" "$GDRIVE_PATH/" --verbose
+
+                    if [ $? -eq 0 ]; then
+                        log "SUCCESS: Uploaded health report as ${TODAY}-health-report.md"
+                    else
+                        log "WARNING: Failed to upload health report to Google Drive"
+                    fi
+                else
+                    log "WARNING: Health report not found at $MD_FILE"
+                fi
+            else
+                log "WARNING: Health analyzer failed with exit code $ANALYZER_EXIT_CODE"
+                log "Analyzer output: $ANALYZER_OUTPUT"
+            fi
+        else
+            log "INFO: Claude analyzer not found at $ANALYZER_SCRIPT - skipping analysis"
+        fi
+    else
+        log "INFO: Skipping health analysis (only runs at 8am, current hour: ${CURRENT_HOUR})"
+    fi
+
     # Clean up old timestamped exports from Google Drive (keep last 7 days)
     log "Cleaning up old exports from Google Drive..."
     rclone delete "$GDRIVE_PATH/" --min-age ${KEEP_LOCAL_DAYS}d --include "garmin_export_*.zip" 2>/dev/null
+    rclone delete "$GDRIVE_PATH/" --min-age ${KEEP_LOCAL_DAYS}d --include "*-health-report.md" 2>/dev/null
     
     # Clean up temp file
     rm "$TEMP_DIR/${EXPORT_NAME}.zip"
