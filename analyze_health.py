@@ -7,9 +7,6 @@ Processes Garmin CSV exports and generates comprehensive health reports using Cl
 import pandas as pd
 import sys
 import os
-import zipfile
-import tempfile
-import shutil
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -18,63 +15,115 @@ from anthropic import Anthropic
 # Load environment variables
 load_dotenv()
 
-def extract_personal_trainer_skill(skill_path):
-    """Extract and load the personal trainer skill from ZIP file"""
+def load_skill_file(skill_path):
+    """Load the personal trainer skill from SKILL.md file and extract user profile path"""
+    import re
+
     try:
-        temp_dir = tempfile.mkdtemp()
-        with zipfile.ZipFile(skill_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-
-        # Read the SKILL.md file
-        skill_file = Path(temp_dir) / 'personal-trainer' / 'SKILL.md'
-        with open(skill_file, 'r') as f:
+        with open(skill_path, 'r') as f:
             content = f.read()
-
-        shutil.rmtree(temp_dir)
 
         # Extract just the content after the frontmatter
         if content.startswith('---'):
             # Split by --- and take everything after the second ---
             parts = content.split('---', 2)
             if len(parts) >= 3:
-                return parts[2].strip()
+                content = parts[2].strip()
 
-        return content.strip()
+        # Extract USER_PROFILE_PATH from content
+        user_profile_path = None
+        match = re.search(r'USER_PROFILE_PATH:\s*(.+)', content)
+        if match:
+            relative_path = match.group(1).strip()
+            # Resolve relative path based on SKILL.md location
+            skill_dir = Path(skill_path).parent
+            user_profile_path = skill_dir / relative_path
+
+        return content, user_profile_path
 
     except Exception as e:
         print(f"Error loading personal trainer skill: {e}")
         sys.exit(1)
 
-def extract_zip(zip_path):
-    """Extract ZIP file to temporary directory"""
-    temp_dir = tempfile.mkdtemp()
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(temp_dir)
-    return temp_dir
 
-def load_csv_data(data_dir):
-    """Load all CSV files from the data directory"""
+def load_user_profile(user_path):
+    """Load user profile data from User.md file"""
+    try:
+        with open(user_path, 'r') as f:
+            content = f.read()
+        return content.strip()
+    except Exception as e:
+        print(f"Error loading user profile: {e}")
+        sys.exit(1)
+
+
+def parse_markdown_tables(md_path):
+    """Parse markdown file and extract tables as pandas DataFrames"""
+    import re
+    from io import StringIO
+
     data = {}
-    csv_files = [
-        'ActivitySummary.csv',
-        'ActivityLap.csv',
-        'ActivitySession.csv',
-        'BoulderProblems.csv',
-        'ClimbingRoutes.csv',
-        'DailyStats.csv',
-        'SleepSummary.csv',
-        'VO2_Max.csv',
-        'TrainingReadiness.csv'
-    ]
 
-    for csv_file in csv_files:
-        file_path = Path(data_dir) / csv_file
-        if file_path.exists():
+    try:
+        with open(md_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading markdown file: {e}")
+        return data
+
+    # Split by ## headers to get sections
+    sections = re.split(r'^## ', content, flags=re.MULTILINE)
+
+    for section in sections[1:]:  # Skip content before first ##
+        lines = section.strip().split('\n')
+        if not lines:
+            continue
+
+        # First line is the title
+        title = lines[0].strip()
+        # Convert title to key format (e.g., "Activity Summary" -> "ActivitySummary")
+        key = title.replace(' ', '')
+
+        # Find table lines (start with |)
+        table_lines = [line for line in lines[1:] if line.strip().startswith('|')]
+
+        if len(table_lines) < 2:
+            # No valid table (need header + separator at minimum)
+            continue
+
+        # Skip "*No data available*" sections
+        if any('No data available' in line for line in lines):
+            continue
+
+        # Parse the table
+        header_line = table_lines[0]
+        # Skip separator line (index 1)
+        data_lines = table_lines[2:] if len(table_lines) > 2 else []
+
+        # Extract header columns
+        headers = [col.strip() for col in header_line.split('|')[1:-1]]
+
+        # Extract data rows
+        rows = []
+        for line in data_lines:
+            cols = [col.strip().replace('\\|', '|') for col in line.split('|')[1:-1]]
+            # Pad row if needed
+            while len(cols) < len(headers):
+                cols.append('')
+            rows.append(cols)
+
+        if headers and rows:
             try:
-                df = pd.read_csv(file_path)
-                data[csv_file.replace('.csv', '')] = df
+                df = pd.DataFrame(rows, columns=headers)
+                # Convert numeric columns
+                for col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='ignore')
+                data[key] = df
+                print(f"  Loaded {key}: {len(df)} rows")
             except Exception as e:
-                print(f"Warning: Could not load {csv_file}: {e}")
+                print(f"  Warning: Could not parse {key}: {e}")
+
+    return data
 
     return data
 
@@ -155,7 +204,9 @@ def analyze_weekly_activities(data, today=None):
         activity_info = {
             'type': activity_type,
             'duration': duration_seconds,
-            'name': row.get('activityName', activity_type)
+            'name': row.get('activityName', activity_type),
+            'averageHR': row.get('averageHR'),
+            'maxHR': row.get('maxHR'),
         }
 
         if date not in daily_activities:
@@ -179,13 +230,114 @@ def analyze_weekly_activities(data, today=None):
                 if act_type == "Indoor Climbing":
                     act_type = "Climbing"
                 duration_str = format_duration(act['duration'])
-                activity_strs.append(f"{act_type} ({duration_str})")
+
+                # Include HR data for cardio activities
+                hr_info = ""
+                if act['averageHR'] and act['maxHR'] and act['type'] in ['running', 'cycling', 'indoor_cycling']:
+                    avg_hr = int(act['averageHR']) if not pd.isna(act['averageHR']) else None
+                    max_hr = int(act['maxHR']) if not pd.isna(act['maxHR']) else None
+                    if avg_hr and max_hr:
+                        hr_info = f", Avg HR {avg_hr}, Max HR {max_hr}"
+
+                activity_strs.append(f"{act_type} ({duration_str}{hr_info})")
 
             summary_lines.append(f"* {day_name} {date_str}: {' + '.join(activity_strs)}")
         else:
             summary_lines.append(f"* {day_name} {date_str}: REST DAY (no activities recorded)")
 
     return '\n'.join(summary_lines)
+
+def analyze_climbing_bouldering(data, today=None):
+    """Analyze climbing and bouldering performance"""
+    if today is None:
+        today = pd.Timestamp.now(tz='UTC')
+    elif not isinstance(today, pd.Timestamp):
+        today = pd.Timestamp(today, tz='UTC')
+
+    climbing_routes = data.get('ClimbingRoutes')
+    boulder_problems = data.get('BoulderProblems')
+    activities = data.get('ActivitySummary')
+
+    week_start = (today - pd.Timedelta(days=7)).normalize()
+
+    summary_parts = []
+
+    # Get recent climbing activity IDs
+    recent_climbing_ids = set()
+    if activities is not None and not activities.empty:
+        recent_activities = activities[
+            (activities['time'] >= week_start) &
+            (activities['activityType'].isin(['indoor_climbing', 'bouldering']))
+        ]
+        recent_climbing_ids = set(recent_activities['ActivityID'].tolist())
+
+    # Analyze climbing routes
+    if climbing_routes is not None and not climbing_routes.empty:
+        recent_routes = climbing_routes[climbing_routes['ActivityID'].isin(recent_climbing_ids)]
+
+        if not recent_routes.empty:
+            summary_parts.append("\n**Climbing Routes (Last 7 Days):**")
+
+            total_routes = len(recent_routes)
+            summary_parts.append(f"- Total routes attempted: {total_routes}")
+
+            # Analyze by grade if available
+            if 'climbingGrade' in recent_routes.columns:
+                grade_counts = recent_routes['climbingGrade'].value_counts()
+                grades_str = ", ".join([f"{grade}: {count}" for grade, count in grade_counts.items()])
+                summary_parts.append(f"- Grades attempted: {grades_str}")
+
+            # Success rate if result type available
+            if 'resultType' in recent_routes.columns:
+                completed = recent_routes[recent_routes['resultType'].isin(['completed', 'Completed', 'COMPLETED', 'sent', 'Sent'])].shape[0]
+                success_rate = (completed / total_routes * 100) if total_routes > 0 else 0
+                summary_parts.append(f"- Completion rate: {success_rate:.0f}% ({completed}/{total_routes})")
+
+            # Average attempts if available
+            if 'attemptCount' in recent_routes.columns:
+                avg_attempts = recent_routes['attemptCount'].mean()
+                summary_parts.append(f"- Average attempts per route: {avg_attempts:.1f}")
+
+            # Total climbing duration
+            total_duration = recent_routes['Duration'].sum() if 'Duration' in recent_routes.columns else 0
+            summary_parts.append(f"- Total climbing time: {format_duration(total_duration)}")
+
+    # Analyze boulder problems
+    if boulder_problems is not None and not boulder_problems.empty:
+        recent_problems = boulder_problems[boulder_problems['ActivityID'].isin(recent_climbing_ids)]
+
+        if not recent_problems.empty:
+            summary_parts.append("\n**Bouldering Problems (Last 7 Days):**")
+
+            total_problems = len(recent_problems)
+            summary_parts.append(f"- Total problems attempted: {total_problems}")
+
+            # Analyze by grade if available
+            if 'boulderingGrade' in recent_problems.columns:
+                grade_counts = recent_problems['boulderingGrade'].value_counts()
+                grades_str = ", ".join([f"{grade}: {count}" for grade, count in grade_counts.items()])
+                summary_parts.append(f"- Grades attempted: {grades_str}")
+
+            # Success rate if result type available
+            if 'resultType' in recent_problems.columns:
+                completed = recent_problems[recent_problems['resultType'].isin(['completed', 'Completed', 'COMPLETED', 'sent', 'Sent', 'topped', 'Topped'])].shape[0]
+                success_rate = (completed / total_problems * 100) if total_problems > 0 else 0
+                summary_parts.append(f"- Completion rate: {success_rate:.0f}% ({completed}/{total_problems})")
+
+            # Average attempts if available
+            if 'attemptCount' in recent_problems.columns:
+                avg_attempts = recent_problems['attemptCount'].mean()
+                summary_parts.append(f"- Average attempts per problem: {avg_attempts:.1f}")
+
+            # Total bouldering duration
+            total_duration = recent_problems['Duration'].sum() if 'Duration' in recent_problems.columns else 0
+            summary_parts.append(f"- Total bouldering time: {format_duration(total_duration)}")
+
+    if not summary_parts:
+        return ""
+
+    return '\n'.join(summary_parts)
+
 
 def analyze_hrv(data):
     """Analyze HRV trends"""
@@ -262,6 +414,7 @@ def format_data_for_claude(data):
     prompt_parts = [
         f"Today is {today_str}. Please analyze my recent Garmin health and training data and provide a comprehensive daily health report.\n",
         analyze_weekly_activities(data),
+        analyze_climbing_bouldering(data),
         analyze_hrv(data),
     ]
 
@@ -282,12 +435,12 @@ def format_data_for_claude(data):
         if daily['avg_resting_hr'] != 'N/A':
             prompt_parts.append(f"- Resting Heart Rate: {daily['avg_resting_hr']:.0f} bpm")
 
-    prompt_parts.append("\n\nPlease provide a comprehensive health report with:\n1. Daily Performance Summary\n2. Activity-Specific Coaching (if applicable)\n3. Recovery & Readiness Insights\n4. Recommendations for today and tomorrow")
+    prompt_parts.append("\n\nPlease provide a comprehensive health report with:\n1. Daily Performance Summary\n2. Activity-Specific Coaching (including climbing/bouldering analysis if data is present)\n3. Recovery & Readiness Insights\n4. Recommendations for today and tomorrow")
 
     return '\n'.join(prompt_parts)
 
 def call_claude_api(skill_content, user_data, api_key, model):
-    """Call Claude API with personal trainer skill and user data"""
+    """Call Claude API with personal trainer skill and training data"""
     try:
         client = Anthropic(api_key=api_key)
 
@@ -309,15 +462,16 @@ def call_claude_api(skill_content, user_data, api_key, model):
 def save_report(content, output_dir):
     """Save markdown report to file"""
     today = datetime.now()
-    filename = f"{today.strftime('%Y-%m-%d')}-health-report.md"
+    filename = f"training_analysis_{today.strftime('%Y-%m-%d')}.md"
     filepath = Path(output_dir) / filename
 
     try:
-        with open(filepath, 'w') as f:
-            f.write(f"# Health Report - {today.strftime('%A, %B %d, %Y')}\n\n")
-            f.write(content)
+        report_content = f"# Training Analysis - {today.strftime('%A, %B %d, %Y')}\n\n{content}"
 
+        with open(filepath, 'w') as f:
+            f.write(report_content)
         print(f"\n✓ Report saved to: {filepath}")
+
         return filepath
 
     except Exception as e:
@@ -326,11 +480,11 @@ def save_report(content, output_dir):
 
 def main():
     # Load configuration
-    export_zip_path = os.getenv('EXPORT_ZIP_PATH', '/home/dietpi/latest-garmin-export.zip')
+    summary_file_path = os.getenv('SUMMARY_FILE_PATH', '/home/dietpi/garmin-reports/garmin_export.md')
     report_output_dir = os.getenv('REPORT_OUTPUT_DIR', '/home/dietpi/garmin-reports')
-    skill_path = os.getenv('PERSONAL_TRAINER_SKILL_PATH', '/home/dietpi/garmin-claude-analyzer/personal-trainer.skill')
+    skill_path = os.getenv('PERSONAL_TRAINER_SKILL_PATH', '/home/dietpi/garmin-claude-analyzer/SKILL.md')
     api_key = os.getenv('ANTHROPIC_API_KEY')
-    model = os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-5-20250929')
+    model = os.getenv('CLAUDE_MODEL', 'claude-opus-4-5-20251101')
 
     # Validate configuration
     if not api_key:
@@ -338,8 +492,8 @@ def main():
         print("Please create a .env file with your API key")
         sys.exit(1)
 
-    if not Path(export_zip_path).exists():
-        print(f"Error: Export file not found: {export_zip_path}")
+    if not Path(summary_file_path).exists():
+        print(f"Error: Summary file not found: {summary_file_path}")
         sys.exit(1)
 
     if not Path(skill_path).exists():
@@ -349,25 +503,39 @@ def main():
     print("="*60)
     print("GARMIN CLAUDE HEALTH ANALYZER")
     print("="*60)
-    print(f"Export file: {export_zip_path}")
+    print(f"Summary file: {summary_file_path}")
     print(f"Output directory: {report_output_dir}")
     print(f"Model: {model}\n")
 
-    # Load personal trainer skill
+    # Load personal trainer skill (extracts user profile path from SKILL.md)
     print("Loading personal trainer skill...")
-    skill_content = extract_personal_trainer_skill(skill_path)
-    print(f"✓ Loaded skill ({len(skill_content)} characters)\n")
+    skill_content, user_profile_path = load_skill_file(skill_path)
+    print(f"✓ Loaded skill ({len(skill_content)} characters)")
 
-    # Extract and load data
-    print("Extracting CSV data...")
-    data_dir = extract_zip(export_zip_path)
-    data = load_csv_data(data_dir)
+    # Load user profile from path specified in SKILL.md
+    if user_profile_path and user_profile_path.exists():
+        print(f"Loading user profile from {user_profile_path}...")
+        user_profile = load_user_profile(user_profile_path)
+        print(f"✓ Loaded user profile ({len(user_profile)} characters)\n")
+    else:
+        print("Warning: No user profile path found in SKILL.md or file doesn't exist")
+        user_profile = ""
+
+    # Parse markdown summary file
+    print("Parsing markdown summary...")
+    data = parse_markdown_tables(summary_file_path)
     data = parse_timestamps(data)
-    print(f"✓ Loaded {len(data)} data files\n")
+    print(f"✓ Loaded {len(data)} data tables\n")
 
     # Format data for Claude
     print("Formatting data for analysis...")
-    user_prompt = format_data_for_claude(data)
+    training_data = format_data_for_claude(data)
+
+    # Combine user profile with training data
+    if user_profile:
+        user_prompt = f"# Athlete Profile\n\n{user_profile}\n\n---\n\n# Training Data\n\n{training_data}"
+    else:
+        user_prompt = training_data
     print(f"✓ Prepared {len(user_prompt)} characters of data\n")
 
     # Call Claude API
@@ -388,9 +556,6 @@ def main():
     else:
         print("✗ Failed to generate report")
         sys.exit(1)
-
-    # Cleanup
-    shutil.rmtree(data_dir)
 
 if __name__ == "__main__":
     main()
